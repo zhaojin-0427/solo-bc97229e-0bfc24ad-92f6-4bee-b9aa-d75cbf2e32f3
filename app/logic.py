@@ -32,6 +32,10 @@ class CsvFormatError(Exception):
     """CSV 结构(表头)非法。"""
 
 
+class CancelNotAllowedError(Exception):
+    """装载线程在事务内发现批次已被取消:放弃本次写入并终止该批处理。"""
+
+
 # ---------------------------------------------------------------- CSV 解析
 
 def normalize_header(raw_header):
@@ -116,54 +120,74 @@ def read_header(f):
 
 # ------------------------------------------------------------ 单行应用(可作用于 results 或 results_staging)
 
-def apply_correction(conn, table, report_no, item, result, revision):
+def _table_clause(table, batch_id):
+    """results_staging 按批次隔离;results 为全局正式表,无批次维度。"""
+    if table == "results_staging":
+        if batch_id is None:
+            raise ValueError("写入暂存区必须提供 batch_id")
+        return "batch_id = ? AND ", (batch_id,)
+    return "", ()
+
+
+def apply_correction(conn, table, report_no, item, result, revision, batch_id=None):
     """更正:仅更高修订且高于撤回水位时生效。返回是否生效。"""
+    scope, scope_args = _table_clause(table, batch_id)
     cur = conn.execute(
         f"""
-        INSERT INTO {table} (report_no, item, result, revision, withdrawn_rev, active)
-        VALUES (?, ?, ?, ?, 0, 1)
-        ON CONFLICT(report_no, item) DO UPDATE SET
+        INSERT INTO {table} ({'batch_id, ' if scope else ''}report_no, item, result,
+                              revision, withdrawn_rev, active)
+        VALUES ({'?, ' if scope else ''}?, ?, ?, ?, 0, 1)
+        ON CONFLICT{('(batch_id, report_no, item)' if scope else '(report_no, item)')}
+        DO UPDATE SET
             result   = excluded.result,
             revision = excluded.revision,
             active   = 1
         WHERE excluded.revision > {table}.revision
           AND excluded.revision > {table}.withdrawn_rev
         """,
-        (report_no, item, result, revision),
+        (*scope_args, report_no, item, result, revision),
     )
     return cur.rowcount > 0
 
 
-def apply_withdrawal(conn, table, report_no, item, revision):
+def apply_withdrawal(conn, table, report_no, item, revision, batch_id=None):
     """撤回:记录撤回水位;水位 >= 当前修订时结果失效(墓碑)。"""
+    scope, scope_args = _table_clause(table, batch_id)
     conn.execute(
         f"""
-        INSERT INTO {table} (report_no, item, result, revision, withdrawn_rev, active)
-        VALUES (?, ?, NULL, 0, ?, 0)
-        ON CONFLICT(report_no, item) DO UPDATE SET
+        INSERT INTO {table} ({'batch_id, ' if scope else ''}report_no, item, result,
+                              revision, withdrawn_rev, active)
+        VALUES ({'?, ' if scope else ''}?, ?, NULL, 0, ?, 0)
+        ON CONFLICT{('(batch_id, report_no, item)' if scope else '(report_no, item)')}
+        DO UPDATE SET
             withdrawn_rev = MAX({table}.withdrawn_rev, excluded.withdrawn_rev),
             active = CASE WHEN excluded.withdrawn_rev >= {table}.revision
                           THEN 0 ELSE {table}.active END,
             result = CASE WHEN excluded.withdrawn_rev >= {table}.revision
                           THEN NULL ELSE {table}.result END
         """,
-        (report_no, item, revision),
+        (*scope_args, report_no, item, revision),
     )
 
 
-def stage_full_row(conn, report_no, item, result, revision):
-    """全量行入暂存区;文件内重复键取最高修订。"""
+def stage_full_row(conn, batch_id, report_no, item, result, revision):
+    """全量行入本批暂存区;文件内重复键取最高修订。
+
+    暂存按 batch_id 隔离:被取消旧批的迟到写入只落到自己的命名空间,
+    不可能污染新批次暂存区。
+    """
     conn.execute(
         """
-        INSERT INTO results_staging (report_no, item, result, revision, withdrawn_rev, active)
-        VALUES (?, ?, ?, ?, 0, 1)
-        ON CONFLICT(report_no, item) DO UPDATE SET
+        INSERT INTO results_staging (batch_id, report_no, item, result, revision,
+                                     withdrawn_rev, active)
+        VALUES (?, ?, ?, ?, ?, 0, 1)
+        ON CONFLICT(batch_id, report_no, item) DO UPDATE SET
             result   = excluded.result,
             revision = excluded.revision,
             active   = 1
         WHERE excluded.revision > results_staging.revision
         """,
-        (report_no, item, result, revision),
+        (batch_id, report_no, item, result, revision),
     )
 
 
@@ -195,49 +219,66 @@ def confirm_increment(conn, batch_id, report_no, item, action, result, revision)
 # ---------------------------------------------------------------- 基线合并切换
 
 def merge_and_switch(conn, batch_id):
-    """在已开启的事务内执行:墓碑承继 -> 回放期间增量 -> 原子切换。"""
+    """在已开启的事务内执行:墓碑承继 -> 回放期间增量 -> 原子切换。
+
+    与取消互斥:事务内再次确认批次仍处于可切换状态,已取消则抛
+    CancelNotAllowedError,由调用方回滚——取消与切换至多一个生效。
+    """
     batch = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
     if batch is None or batch["kind"] != "full":
         raise RuntimeError(f"全量批次不存在: {batch_id}")
+    if batch["status"] not in ("loading", "staging_ready"):
+        # 已取消/已完成/已失败:拒绝切换(切换与取消只能有一个生效)
+        raise CancelNotAllowedError(f"批次 {batch_id} 状态为 {batch['status']},禁止切换")
     start_seq = batch["start_seq"]
 
-    # 1) 旧正式表中的撤回墓碑承继到暂存区:
+    # 1) 旧正式表中的撤回墓碑承继到本批暂存区:
     #    暂存区修订 <= 撤回水位 => 保持失效;缺失的键保留墓碑,杜绝旧修订复活。
     conn.execute(
         """
-        INSERT INTO results_staging (report_no, item, result, revision, withdrawn_rev, active)
-        SELECT report_no, item, result, revision, withdrawn_rev, active
+        INSERT INTO results_staging (batch_id, report_no, item, result, revision,
+                                     withdrawn_rev, active)
+        SELECT ?, report_no, item, result, revision, withdrawn_rev, active
           FROM results WHERE active = 0
-        ON CONFLICT(report_no, item) DO UPDATE SET
+        ON CONFLICT(batch_id, report_no, item) DO UPDATE SET
             withdrawn_rev = MAX(results_staging.withdrawn_rev, excluded.withdrawn_rev),
             active = CASE WHEN excluded.withdrawn_rev >= results_staging.revision
                           THEN 0 ELSE results_staging.active END,
             result = CASE WHEN excluded.withdrawn_rev >= results_staging.revision
                           THEN NULL ELSE results_staging.result END
-        """
+        """,
+        (batch_id,),
     )
 
-    # 2) 回放装载期间(及恢复后)全部已确认增量,按确认顺序
+    # 2) 回放需要承继的已确认增量,按确认顺序:
+    #    a) seq > start_seq:本批装载期间确认的增量;
+    #    b) replay_required=1:确认时所在的全量批次被取消/失败、从未切换的
+    #       “孤儿增量”(可能 seq <= 本批 start_seq),必须在本次成功切换承继。
+    #    装载前确认且无孤儿标记的增量按约定已包含在全量导出中,不回放。
     pending = conn.execute(
-        "SELECT seq, report_no, item, action, result, revision"
-        " FROM increments WHERE seq > ? ORDER BY seq", (start_seq,),
+        "SELECT seq, report_no, item, action, result, revision FROM increments"
+        " WHERE seq > ? OR replay_required = 1 ORDER BY seq", (start_seq,),
     ).fetchall()
     for row in pending:
         if row["action"] == CORRECT:
             apply_correction(conn, "results_staging", row["report_no"], row["item"],
-                             row["result"], row["revision"])
+                             row["result"], row["revision"], batch_id=batch_id)
         else:
             apply_withdrawal(conn, "results_staging", row["report_no"], row["item"],
-                             row["revision"])
+                             row["revision"], batch_id=batch_id)
 
-    # 3) 原子切换:暂存区整体成为新正式表。
+    # 3) 原子切换:本批暂存区整体成为新正式表。
     #    全量缺失且未被增量更正的旧项目自然消失(移除)。
     conn.execute("DELETE FROM results")
     conn.execute(
         "INSERT INTO results (report_no, item, result, revision, withdrawn_rev, active)"
-        " SELECT report_no, item, result, revision, withdrawn_rev, active FROM results_staging"
+        " SELECT report_no, item, result, revision, withdrawn_rev, active"
+        " FROM results_staging WHERE batch_id=?",
+        (batch_id,),
     )
-    conn.execute("DELETE FROM results_staging")
+    conn.execute("DELETE FROM results_staging WHERE batch_id=?", (batch_id,))
+    # 本次成功切换已承继全部孤儿增量:清除待回放标记(同事务,崩溃则整体回滚)
+    conn.execute("UPDATE increments SET replay_required=0 WHERE replay_required=1")
     conn.execute(
         "UPDATE batches SET status='done', updated_at=datetime('now') WHERE id=?",
         (batch_id,),
@@ -265,3 +306,33 @@ def current_results(conn, report_no=None, include_withdrawn=False):
 def max_increment_seq(conn):
     row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS s FROM increments").fetchone()
     return row["s"]
+
+
+# ---------------------------------------------------------------- 批次取消
+
+def cancel_full_batch(conn, batch_id):
+    """取消全量批次(须在已开启的事务内调用)。
+
+    仅 loading / staging_ready 可取消;条件 UPDATE 保证与切换互斥:
+    若状态已被切换事务改为 done,本次更新 0 行,取消失败。
+    同时:
+      - 只清理“本批”暂存区,绝不触碰其他批次(如取消后立即上传的新批);
+      - 把该批装载期间(seq > start_seq)确认的增量标记为孤儿
+        (replay_required=1):它们已立即作用于正式表,但本次基线不再切换,
+        下一次成功切换必须回放,保证已确认增量跨基线不丢失。
+    返回是否发生了状态迁移(重复取消时为 False,终态保持不变)。
+    """
+    batch = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+    if batch is None or batch["kind"] != "full":
+        return False
+    cur = conn.execute(
+        "UPDATE batches SET status='canceled', updated_at=datetime('now')"
+        " WHERE id=? AND kind='full' AND status IN ('loading','staging_ready')",
+        (batch_id,),
+    )
+    if cur.rowcount == 0:
+        return False
+    conn.execute("DELETE FROM results_staging WHERE batch_id=?", (batch_id,))
+    conn.execute("UPDATE increments SET replay_required=1 WHERE seq > ?",
+                 (batch["start_seq"],))
+    return True

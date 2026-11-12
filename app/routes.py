@@ -34,12 +34,16 @@ def _save_upload(file_storage):
 
 
 def _create_full_batch(path, orig):
-    """登记全量批次;数据库部分唯一索引保证同一时刻仅一个装载。"""
+    """登记全量批次;数据库部分唯一索引保证同一时刻仅一个装载。
+
+    暂存区按 batch_id 隔离,无需清空:取消/失败旧批的残留只属于旧批,
+    新批有独立命名空间,旧执行的迟到写入不可能污染本批暂存区。
+    start_seq 记录装载开始时的增量水位,用于界定“装载期间增量”。
+    """
     conn = db.get_db()
     size = os.path.getsize(path)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("DELETE FROM results_staging")  # 清掉上次失败残留的暂存区
         cur = conn.execute(
             "INSERT INTO batches (kind, filename, orig_name, status, total_bytes, start_seq)"
             " VALUES ('full', ?, ?, 'loading', ?, ?)",
@@ -159,6 +163,50 @@ def load_sample(name):
                     "message": f"示例增量批次 #{batch_id} 已确认并应用"})
 
 
+# ------------------------------------------------------------------ 取消
+
+@bp.post("/api/batches/<int:batch_id>/cancel")
+def cancel_batch(batch_id):
+    """取消全量批次:停止后续装载、增量回放与切换,保留现有正式结果。
+
+    - 仅适用于装载中(loading)、待切换(staging_ready)的全量批次;
+    - 已切换(done)拒绝取消——取消与切换至多一个生效;
+    - 重复取消幂等:返回同一 canceled 终态;
+    - 取消后立即释放单装载约束,可马上上传新全量;旧批迟到处理只写本批
+      命名空间(已清理),不会写入或清空新批暂存区。
+    """
+    conn = db.get_db()
+    batch = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+    if batch is None:
+        return _err(f"批次 #{batch_id} 不存在", 404)
+    if batch["kind"] != "full":
+        return _err(f"批次 #{batch_id} 是增量批次,取消仅适用于全量批次", 400)
+    if batch["status"] == "canceled":
+        return jsonify({"ok": True, "already": True,
+                        "batch": _batch_json(batch),
+                        "message": f"全量批次 #{batch_id} 已处于取消终态"})
+    if batch["status"] == "done":
+        return _err(f"批次 #{batch_id} 已完成基线切换,不能取消(切换与取消只能有一个生效)", 409)
+    if batch["status"] == "failed":
+        return _err(f"批次 #{batch_id} 已失败,无需取消", 409)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        moved = logic.cancel_full_batch(conn, batch_id)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    if not moved:
+        # 并发竞争:事务内状态已被切换事务改变
+        fresh = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        return _err(f"批次 #{batch_id} 状态已变为 {fresh['status']},取消未生效", 409)
+    fresh = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+    return jsonify({"ok": True, "already": False, "batch": _batch_json(fresh),
+                    "message": f"全量批次 #{batch_id} 已取消:停止装载与切换,"
+                               f"正式结果及已确认增量保持不变,可立即换传新全量"})
+
+
 # ------------------------------------------------------------------ 取数与进度
 
 @bp.get("/api/results")
@@ -204,10 +252,14 @@ def api_status():
     loading = conn.execute(
         "SELECT id, status FROM batches WHERE kind='full'"
         " AND status IN ('loading','staging_ready')").fetchone()
+    canceled = conn.execute(
+        "SELECT COUNT(*) AS c FROM batches WHERE kind='full' AND status='canceled'"
+    ).fetchone()["c"]
     return jsonify({
         "active_results": active, "withdrawn_records": withdrawn,
         "confirmed_increments": inc,
         "full_load_in_progress": dict(loading) if loading else None,
+        "canceled_full_batches": canceled,
     })
 
 

@@ -41,6 +41,13 @@ def is_claimed(batch_id):
         return batch_id in _claimed
 
 
+def _check_not_canceled(conn, batch_id):
+    """取消检查点:批次已转入 canceled 终态则抛出,装载线程立即停止。"""
+    st = conn.execute("SELECT status FROM batches WHERE id=?", (batch_id,)).fetchone()
+    if st is not None and st["status"] == "canceled":
+        raise logic.CancelNotAllowedError(f"批次 {batch_id} 已取消,停止后续装载/切换")
+
+
 # ------------------------------------------------------------------ 全量
 
 def process_full_batch(conn, batch_id, chunk_size, chunk_delay=0.0,
@@ -54,10 +61,11 @@ def process_full_batch(conn, batch_id, chunk_size, chunk_delay=0.0,
             if batch is None or batch["kind"] != "full":
                 return True
             if batch["status"] == "staging_ready":
-                _merge_and_switch(conn, batch_id)
+                _merge_and_switch(conn, batch_id)   # 内部事务含取消守卫
                 return True
             if batch["status"] != "loading":
-                return True
+                return True                        # canceled/done/failed:不再恢复
+            _check_not_canceled(conn, batch_id)
 
             path = batch["filename"]
             size = os.path.getsize(path)
@@ -83,6 +91,8 @@ def process_full_batch(conn, batch_id, chunk_size, chunk_delay=0.0,
                 while True:
                     if max_chunks is not None and chunks >= max_chunks:
                         raise PauseProcessing()
+                    # 取消检查点:等待停止期间不持有写锁,增量上传与取数不受阻塞
+                    _check_not_canceled(conn, batch_id)
                     rows, last_offset, eof = [], None, False
                     while len(rows) < chunk_size:
                         row = next(reader, None)
@@ -98,6 +108,9 @@ def process_full_batch(conn, batch_id, chunk_size, chunk_delay=0.0,
                     applied = errors = 0
                     conn.execute("BEGIN IMMEDIATE")
                     try:
+                        # 事务内守卫:若本块等待写锁期间批次被取消,整块回滚,
+                        # 旧批的迟到数据不会写入(也不会清空)任何暂存区。
+                        _check_not_canceled(conn, batch_id)
                         for row in rows:
                             if not row or all(not (c or "").strip() for c in row):
                                 continue  # 跳过空行
@@ -106,7 +119,7 @@ def process_full_batch(conn, batch_id, chunk_size, chunk_delay=0.0,
                             except ValueError:
                                 errors += 1
                                 continue
-                            logic.stage_full_row(conn, *r)
+                            logic.stage_full_row(conn, batch_id, *r)
                             applied += 1
                         conn.execute(
                             "UPDATE batches SET processed_bytes=?, total_rows=total_rows+?,"
@@ -257,6 +270,9 @@ def run_pending(data_dir, chunk_size, chunk_delay=0.0, max_chunks=None, chunk_ho
             except logic.CsvFormatError as exc:
                 for bid in inc_ids + full_ids:
                     mark_failed(data_dir, bid, exc)
+            except logic.CancelNotAllowedError:
+                # 批次已被取消(终态):find_pending 不再返回它,继续其余批次
+                continue
             except PauseProcessing:
                 break
             if max_chunks is not None:
@@ -267,10 +283,25 @@ def run_pending(data_dir, chunk_size, chunk_delay=0.0, max_chunks=None, chunk_ho
 
 
 def mark_failed(data_dir, batch_id, message):
+    """标记批次失败。全量批次失败与取消等价地“从未切换”:其装载期间确认的
+    增量标记为孤儿,由下一次成功切换回放,避免换传后已确认增量丢失。"""
     conn = db.connect(data_dir)
     try:
-        conn.execute("UPDATE batches SET status='failed', error=?,"
-                     " updated_at=datetime('now') WHERE id=?", (str(message), batch_id))
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            batch = conn.execute("SELECT * FROM batches WHERE id=?",
+                                 (batch_id,)).fetchone()
+            conn.execute("UPDATE batches SET status='failed', error=?,"
+                         " updated_at=datetime('now') WHERE id=?", (str(message), batch_id))
+            # 仅清理本批暂存残留;其他批次(如失败后新上传的全量)不受影响
+            conn.execute("DELETE FROM results_staging WHERE batch_id=?", (batch_id,))
+            if batch is not None and batch["kind"] == "full":
+                conn.execute("UPDATE increments SET replay_required=1 WHERE seq > ?",
+                             (batch["start_seq"],))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
     finally:
         conn.close()
 
@@ -298,6 +329,9 @@ def _background_loop(app):
                 process_inc_batch(conn, bid, chunk_size)
             else:
                 process_full_batch(conn, bid, chunk_size, chunk_delay)
+        except logic.CancelNotAllowedError:
+            # 取消为正常终态,不是失败:线程退出,find_pending 不再拾起该批
+            app.logger.info("批次 %s 已取消,停止后台处理", bid)
         except Exception as exc:     # 单批失败不拖垮其他批次
             app.logger.exception("批次 %s 处理失败", bid)
             mark_failed(data_dir, bid, exc)

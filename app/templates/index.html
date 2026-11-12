@@ -32,7 +32,12 @@
   .pill.done { background:#dafbe1; color:#116329; }
   .pill.loading, .pill.processing, .pill.staging_ready { background:#fff8c5; color:#7d4e00; }
   .pill.failed { background:#ffebe9; color:#82071e; }
+  .pill.canceled { background:#e8eaed; color:#57606a; }
   .pill.full { background:#ddf4ff; color:#0969da; } .pill.inc { background:#fbefff; color:#8250df; }
+  button.danger { background:var(--red); }
+  button.danger:hover { filter:brightness(1.08); }
+  button.warn { background:#fff; color:var(--red); border:1px solid var(--red); }
+  button:disabled { background:#d0d7de; color:#fff; cursor:not-allowed; }
   .stat { display:inline-block; margin-right:22px; font-size:13px; }
   .stat b { font-size:20px; margin-right:4px; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
@@ -49,7 +54,7 @@
 <body>
 <header>
   <h1>LIMS 检测结果同步平台</h1>
-  <div class="sub">全量基线装载 · 增量更正/撤回 · 断点续传 · 原子基线切换 · 报告系统取数接口 <code>GET /api/results</code></div>
+  <div class="sub">全量基线装载 · 误传可取消换传 · 增量更正/撤回 · 断点续传 · 原子基线切换 · 报告系统取数接口 <code>GET /api/results</code></div>
 </header>
 <main>
   <section>
@@ -86,12 +91,14 @@
   </section>
 
   <section>
-    <h2>② 导入批次与装载进度</h2>
+    <h2>② 导入批次与装载进度 <span class="tag">装载中/待切换的全量批次可取消;取消后可立即换传新全量</span></h2>
     <table id="batches">
       <thead><tr><th>ID</th><th>类型</th><th>文件</th><th>状态</th><th>进度</th>
-        <th>行数</th><th>已应用</th><th>错误行</th><th>更新时间</th></tr></thead>
+        <th>行数</th><th>已应用</th><th>错误行</th><th>更新时间</th><th>操作</th></tr></thead>
       <tbody></tbody>
     </table>
+    <!-- 取消批次后的“换传”入口:复用全量上传表单 -->
+    <input type="file" id="reupload-picker" accept=".csv" hidden>
   </section>
 
   <section>
@@ -133,7 +140,8 @@ async function j(url, opts){
 }
 const KIND = {full:'全量', inc:'增量'};
 const STATUS = {loading:'装载中', staging_ready:'待切换', processing:'确认中',
-                done:'已完成', failed:'失败'};
+                done:'已完成', failed:'失败', canceled:'已取消'};
+const CANCELABLE = new Set(['loading','staging_ready']);
 
 async function refreshStatus(){
   try{
@@ -142,6 +150,8 @@ async function refreshStatus(){
       `<span class="stat"><b>${s.active_results}</b>条有效结果</span>` +
       `<span class="stat"><b>${s.withdrawn_records}</b>条撤回墓碑</span>` +
       `<span class="stat"><b>${s.confirmed_increments}</b>条已确认增量</span>` +
+      (s.canceled_full_batches
+        ? `<span class="stat" style="color:#57606a">🚫 <b>${s.canceled_full_batches}</b>个全量批次已取消(正式结果未受影响)</span>` : '') +
       (s.full_load_in_progress
         ? `<span class="stat" style="color:#7d4e00">⏳ 全量装载进行中(批次 #${s.full_load_in_progress.id},${STATUS[s.full_load_in_progress.status]})</span>`
         : `<span class="stat" style="color:#2da44e">✓ 无进行中的全量装载</span>`);
@@ -161,12 +171,52 @@ async function refreshBatches(){
         (b.error?` <span class="muted" title="${b.error}">⚠</span>`:'') + `</td>` +
         `<td><span class="bar"><i style="width:${b.progress}%"></i></span> ${b.progress}%</td>` +
         `<td>${b.total_rows}</td><td>${b.applied_rows}</td>` +
-        `<td>${b.error_rows||''}</td><td class="muted">${b.updated_at}</td>`;
+        `<td>${b.error_rows||''}</td><td class="muted">${b.updated_at}</td>` +
+        `<td>${batchActions(b)}</td>`;
       if(b.error) tr.title = b.error;
       tb.appendChild(tr);
     }
+    bindBatchActions();
   }catch(e){}
 }
+
+function batchActions(b){
+  if(b.kind !== 'full') return '<span class="muted">—</span>';
+  if(CANCELABLE.has(b.status)){
+    return `<button class="danger btn-cancel" data-id="${b.id}">取消批次</button>`;
+  }
+  if(b.status === 'canceled'){
+    return `<button class="warn btn-reupload" data-id="${b.id}">换传新全量</button>`;
+  }
+  return '<span class="muted">—</span>';
+}
+
+function bindBatchActions(){
+  document.querySelectorAll('.btn-cancel').forEach(btn=>btn.addEventListener('click', async ()=>{
+    const id = btn.dataset.id;
+    if(!confirm(`确认取消全量批次 #${id}?\n\n将停止该批后续装载、增量回放与切换;现有正式结果及已确认增量保持不变,随后可立即换传正确的全量文件。`)) return;
+    btn.disabled = true;
+    try{
+      const d = await j(`/api/batches/${id}/cancel`, {method:'POST'});
+      toast(d.message||'已取消'); refreshAll();
+    }catch(e){ toast(e.message,false); btn.disabled=false; }
+  }));
+  document.querySelectorAll('.btn-reupload').forEach(btn=>btn.addEventListener('click', ()=>{
+    const picker = $('#reupload-picker');
+    picker.value = '';
+    picker.click();   // 选择文件后走标准全量上传接口
+  }));
+}
+
+$('#reupload-picker').addEventListener('change', async ()=>{
+  const picker = $('#reupload-picker');
+  if(!picker.files.length) return;
+  const fd = new FormData(); fd.append('file', picker.files[0]);
+  try{
+    const d = await j('/upload/full', {method:'POST', body:fd});
+    toast(d.message||'新全量批次已开始装载'); $('#form-full').reset(); refreshAll();
+  }catch(e){ toast(e.message,false); }
+});
 
 async function refreshIncrements(){
   try{
